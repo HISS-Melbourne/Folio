@@ -282,10 +282,12 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
     if (on) last = item;
     document.title = on ? '▶ ' + item.name + ' · ' + BASE_TITLE : BASE_TITLE;
   };
-  const pads = [];
+  const pads = [], padWarm = [], padDecode = [];
 
   // Sound on/off: one switch for every film and loop
   let ctx = null, soundOn = true, gain = null;
+  // Created early (it starts suspended, which every browser allows); the first tap only has to resume it
+  const getCtx = () => ctx || (ctx = new (window.AudioContext || window.webkitAudioContext)());
   const fallbacks = [];
   const master = () => { if (!gain) { gain = ctx.createGain(); gain.gain.value = soundOn ? 1 : 0; gain.connect(ctx.destination); } return gain; };
   const setSound = on => {
@@ -336,7 +338,9 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
     let active = 0;
     const films = [...stage.querySelectorAll('.vid')].map((slide, i) => {
       const id = wk.films[i], v = slide.querySelector('video'), btn = slide.querySelector('.pbtn'), name = filmName(i);
-      const ensure = () => { if (!v.getAttribute('src')) { v.src = SRC.url(id + '.mp4'); v.muted = !soundOn; } };
+      const ensure = () => { if (!v.getAttribute('src')) { v.preload = 'metadata'; v.src = SRC.url(id + '.mp4'); v.muted = !soundOn; } };
+      // 'near' = tile is close to the screen: fetch the opening. 'reach' = a finger or cursor is on it: buffer ahead.
+      const prime = level => { ensure(); if (level === 'reach' && v.preload !== 'auto') { v.preload = 'auto'; if (v.readyState < 2) v.load(); } };
       const stop = () => { if (!v.paused) v.pause(); };
       const toggle = () => { if (v.paused) { ensure(); exclusive(stop); setActive(i); v.play().catch(() => {}); } else v.pause(); };
       const item = { name, toggle };
@@ -353,7 +357,7 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
       });
       v.addEventListener('ended', () => { v.load(); if (active === i) { wave.draw(); cur.textContent = fmt(0); } });
       v.addEventListener('timeupdate', () => { if (active === i) { cur.textContent = fmt(v.currentTime); if (v.paused) wave.draw(); } });
-      return { id, v, toggle, ensure };
+      return { id, v, toggle, ensure, prime };
     });
     const setActive = i => {
       if (active === i) return;
@@ -366,6 +370,14 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
       if (f.v.readyState >= 1) go(); else f.v.addEventListener('loadedmetadata', go, { once: true });
     };
     const wave = makeWave(el.querySelector('canvas'), () => films[active].id, pos, seekTo, () => [css(wk.ink) + '40', css(wk.ink)]);
+
+    // Load ahead so play starts straight away, without loading every film on arrival
+    new IntersectionObserver(([en], ob) => { if (en.isIntersecting) { films[active].prime('near'); ob.disconnect(); } },
+      { rootMargin: '300px 0px' }).observe(stage);
+    const reach = e => { const s = e.target.closest && e.target.closest('.vid'); films[s ? +s.dataset.film : active].prime('reach'); };
+    stage.addEventListener('pointerenter', reach);
+    stage.addEventListener('touchstart', reach, { passive: true });
+    stage.addEventListener('focusin', reach);
 
     // Tap anywhere on the tile: a film slide plays itself; a photo plays the film it belongs to
     let downX = 0, downY = 0, moved = false;
@@ -387,7 +399,7 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
         dots.forEach((d, j) => d.setAttribute('aria-current', String(j === i)));
         prev.disabled = i === 0; next.disabled = i === nSlides - 1;
         // Landing on a film slide shows that film's waveform, unless another film in this tile is playing
-        if (i < films.length && films[active].v.paused) setActive(i);
+        if (i < films.length) { films[i].prime('near'); if (films[active].v.paused) setActive(i); }
       };
       track.addEventListener('scroll', () => requestAnimationFrame(sync), { passive: true });
       dots.forEach((d, j) => d.addEventListener('click', e => { e.stopPropagation(); go(j); }));
@@ -403,6 +415,12 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
       <div class="meta"><h2>Tape Loops</h2><span class="keys" aria-hidden="true"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd></span></div>`;
     grid.appendChild(el);
     const box = el.querySelector('.sampler');
+
+    // When the loops come near the screen, fetch all four (about 8 MB) and get the first one ready
+    new IntersectionObserver(([en], ob) => {
+      if (!en.isIntersecting) return; ob.disconnect();
+      padWarm.reduce((p, w) => p.then(() => w().catch(() => {})), Promise.resolve()).then(() => { try { padDecode[0](); } catch (_) {} });
+    }, { rootMargin: '400px 0px' }).observe(box);
 
     LOOPS.forEach((id, i) => {
       const pad = document.createElement('button');
@@ -420,10 +438,17 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
       const setOn = on => { pad.classList.toggle('on', on); pad.setAttribute('aria-pressed', on ? 'true' : 'false'); if (on || last === item) nowPlaying(item, on); };
       // Start fetching the moment someone reaches for the pad, so the first tap plays sooner
       let bytes = null;
-      const warm = () => { bytes = bytes || SRC.bytes(L.file); return bytes; };
-      pad.addEventListener('pointerenter', warm, { once: true });
-      pad.addEventListener('touchstart', warm, { once: true, passive: true });
-      pads.push(pad);
+      const warm = () => { bytes = bytes || SRC.bytes(L.file); bytes.catch(() => { bytes = null; }); return bytes; };
+      const decode = () => {
+        loading = loading || warm().then(ab => new Promise((res, rej) => { const d = getCtx().decodeAudioData(ab.slice(0), res, rej); if (d && d.catch) d.catch(rej); }));
+        loading.then(b => { buf = b; }, () => { loading = null; });
+        return loading;
+      };
+      // Decode when someone reaches for the pad, so the tap itself starts instantly
+      pad.addEventListener('pointerenter', () => { try { decode(); } catch (_) {} });
+      pad.addEventListener('touchstart', () => { try { decode(); } catch (_) {} }, { passive: true });
+      pad.addEventListener('focus', () => { try { decode(); } catch (_) {} });
+      pads.push(pad); padWarm.push(warm); padDecode.push(decode);
       const loop = () => { wave.draw(); raf = requestAnimationFrame(loop); };
       const stop = () => {
         if (src) { try { src.stop(); } catch (_) {} src.disconnect(); src = null; }
@@ -435,13 +460,13 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
         if (pad.classList.contains('on')) { stop(); return; }
         exclusive(stop);
         try {
-          if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
-          if (ctx.state === 'suspended') await ctx.resume();
+          getCtx();
+          const resumed = ctx.state === 'suspended' ? ctx.resume() : null;
           if (!buf && !fallback) {
             pad.classList.add('loading');
-            loading = loading || warm().then(ab => new Promise((res, rej) => { const d = ctx.decodeAudioData(ab.slice(0), res, rej); if (d && d.catch) d.catch(rej); }));
-            buf = await loading;
+            buf = await decode();
           }
+          if (resumed) await resumed;
         } catch (_) {
           if (!fallback) { fallback = new Audio(SRC.url(L.file)); fallback.loop = true; fallback.muted = !soundOn; fallbacks.push(fallback); }
         }
