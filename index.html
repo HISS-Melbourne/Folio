@@ -5,6 +5,20 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HISS - Sound Folio</title>
 <meta name="description" content="HISS sound objects: films, photos and tape loops.">
+<meta name="theme-color" content="#FFFFFF">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="preload" href="fonts/silkscreen.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/vt323.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
+<meta property="og:type" content="website">
+<meta property="og:title" content="HISS - Sound Folio">
+<meta property="og:description" content="Sound objects, films and tape loops by HISS, Melbourne.">
+<meta property="og:url" content="https://hiss-melbourne.github.io/Folio/">
+<meta property="og:image" content="https://hiss-melbourne.github.io/Folio/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
 <style>
 html { color-scheme: light; -webkit-text-size-adjust: 100%; }
 body { margin: 0; }
@@ -71,6 +85,8 @@ header.top { display: flex; flex-wrap: wrap; align-items: center; justify-conten
 .pbtn:hover { background: #174C9E; }
 .pbtn:active { transform: scale(.94); }
 .vid.playing .pbtn { opacity: 0; }
+.vid.failed .pbtn { background: var(--muted); pointer-events: none; }
+.vid.failed::after { content: "Film unavailable"; position: absolute; left: 12px; top: 12px; padding: 5px 8px 4px; background: rgba(0,0,0,.6); font-family: var(--pixel); font-size: 11px; text-transform: uppercase; color: #fff; }
 .vid.playing:hover .pbtn, .vid.playing .pbtn:focus-visible { opacity: 1; }
 button:focus-visible, canvas:focus-visible, a:focus-visible { outline: 2px dashed var(--ink); outline-offset: 3px; }
 
@@ -185,12 +201,16 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
 <script>
 (() => {
   const PEAKS = JSON.parse(document.getElementById('peaks').textContent);
+  const LOOP_T = {"Loop_1": 34.667958, "Loop_2": 29.362667, "Loop_3": 29.562875, "Loop_4": 34.000625};
+  // iPhone: play through the ring/silent switch like the films do (Safari 16.4+); older phones ignore this
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (_) {}
   // Where media comes from. The live page reads files next to it; the single-file build
   // defines window.HISS_MEDIA to serve everything from inside the page instead.
   const SRC = window.HISS_MEDIA || {
     url: n => 'media/' + n,
     bytes: n => fetch('media/' + n).then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); }),
-    loop: id => ({ file: id + '.wav', doubled: false }),
+    // Each loop file holds the loop twice; the player cuts a seamless one-period window from the middle
+    loop: id => ({ file: id + '.mp4', doubled: true, T: LOOP_T[id] }),
   };
   // Order keeps the two dark tiles (PITCHI, ODEO) apart at every column count.
   // `films` lists every film slide in a tile; the first one is the tile's cover.
@@ -296,7 +316,7 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
       <div class="stage" style="aspect-ratio:${wk.ar || '1 / 1'}">
         <div class="track">
           ${wk.films.map((id, i) => `<div class="slide vid" data-film="${i}">
-            <video preload="${i === 0 ? 'metadata' : 'none'}" playsinline poster="${SRC.url(id + '.jpg')}"></video>
+            <video preload="none" playsinline poster="${SRC.url(id + '.jpg')}"></video>
             <div class="ctl"><button class="pbtn riso" type="button" aria-label="Play ${filmName(i)}">${ICON_PLAY}</button></div>
           </div>`).join('')}
           ${photos.map((p, i) => `<img class="slide" src="${SRC.url(p)}" alt="${wk.title}, photo ${i + 1}" loading="lazy" decoding="async">`).join('')}
@@ -317,7 +337,6 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
     const films = [...stage.querySelectorAll('.vid')].map((slide, i) => {
       const id = wk.films[i], v = slide.querySelector('video'), btn = slide.querySelector('.pbtn'), name = filmName(i);
       const ensure = () => { if (!v.getAttribute('src')) { v.src = SRC.url(id + '.mp4'); v.muted = !soundOn; } };
-      if (i === 0) ensure();
       const stop = () => { if (!v.paused) v.pause(); };
       const toggle = () => { if (v.paused) { ensure(); exclusive(stop); setActive(i); v.play().catch(() => {}); } else v.pause(); };
       const item = { name, toggle };
@@ -326,6 +345,12 @@ body::before { content: ""; position: fixed; inset: 0; background-image: var(--r
       const tick = () => { if (active === i) { wave.draw(); cur.textContent = fmt(v.currentTime); } if (!v.paused) requestAnimationFrame(tick); };
       v.addEventListener('play', () => { nowPlaying(item, true); slide.classList.add('playing'); btn.innerHTML = ICON_PAUSE; btn.setAttribute('aria-label', 'Pause ' + name); tick(); });
       v.addEventListener('pause', () => { if (last === item) nowPlaying(item, false); slide.classList.remove('playing'); btn.innerHTML = ICON_PLAY; btn.setAttribute('aria-label', 'Play ' + name); });
+      let retried = false;
+      v.addEventListener('error', () => {
+        if (!v.getAttribute('src')) return;
+        if (!retried) { retried = true; const t = v.currentTime; v.load(); v.addEventListener('loadedmetadata', () => { v.currentTime = t; }, { once: true }); return; }
+        slide.classList.add('failed'); btn.setAttribute('aria-label', name + ' could not load');
+      });
       v.addEventListener('ended', () => { v.load(); if (active === i) { wave.draw(); cur.textContent = fmt(0); } });
       v.addEventListener('timeupdate', () => { if (active === i) { cur.textContent = fmt(v.currentTime); if (v.paused) wave.draw(); } });
       return { id, v, toggle, ensure };
